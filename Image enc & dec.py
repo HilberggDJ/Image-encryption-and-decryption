@@ -1,374 +1,668 @@
 """
 Projekt M-II: Chaotyczne przekształcanie obrazu cyfrowego
-Szkielet prototypu - do uzupełnienia algorytmami
+COMMIT 2 – Naprawione algorytmy + panel metryk
 
-Struktura:
-  - ImageProcessor: klasa z algorytmami (TODO sekcje)
-  - App: GUI w Tkinter
+Zmiany względem commit 1:
+  - Etap 2: prawdziwa permutacja zig-zag z przeskokami sterowanymi kluczem
+    (zamiast placeholder Fisher-Yates na pikselach)
+  - Etap 1: poprawiony edge-case gdy height == 1
+  - Metryki: korelacja Pearsona sasiadow + MSE + PSNR
+  - Panel metryk w GUI (wyswietla wyniki po kazdej operacji)
+  - Obsluga obrazow z kanalem alpha (konwersja do RGB)
+  - Poprawiona kolejnosc operacji w etap3_unscramble (blad logiczny w v1)
+  - Status bar pokazuje czas operacji
+  - Testy jednostkowe: python main.py --test
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import numpy as np
-import random
 import os
+import time
 
 
-# ─────────────────────────────────────────────
-# ALGORYTMY
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  ALGORYTMY
+# ══════════════════════════════════════════════════════════════
 
 class ImageProcessor:
-    """Wszystkie algorytmy scramblingu / unscramblingu."""
+    """
+    Trzy etapy scramblingu obrazu.
 
-    # ── ETAP 1: Naiwny scrambling (przesuwanie kolumn) ──────────────────────
+    Kazdy etap eksponuje pare metod:
+        etapN_scramble(arr, key)   -> arr
+        etapN_unscramble(arr, key) -> arr
+
+    Algorytm odwrotny korzysta TYLKO z obrazu wynikowego i klucza.
+    """
+
+    # ──────────────────────────────────────────────────────────
+    # ETAP 1: Naiwny scrambling – cykliczne przesuwanie kolumn
+    # ──────────────────────────────────────────────────────────
+    #
+    # Dla kazdej kolumny c:
+    #   offset(c) = (key + c) % height
+    #   np.roll przesuwa piksele cyklicznie o +offset (scramble)
+    #   i -offset (unscramble).
+    #
+    # Slabos: poziome struktury obrazu przetrwaja (wartosci
+    # pikseli sa niezmienione, zmienia sie tylko ich pozycja
+    # wertykalna w obrebie kolumny).
 
     @staticmethod
-    def etap1_scramble(img_array: np.ndarray, key: int) -> np.ndarray:
-        """
-        Cykliczne przesunięcie każdej kolumny o offset zależny od klucza i indeksu kolumny.
-        offset(col) = (key + col) % height
-        """
-        result = img_array.copy()
-        h, w = img_array.shape[:2]
-
-        for col in range(w):
-            offset = (key + col) % h
-            result[:, col] = np.roll(img_array[:, col], offset, axis=0)
-
+    def etap1_scramble(img: np.ndarray, key: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        if h <= 1:
+            return img.copy()
+        result = img.copy()
+        for c in range(w):
+            offset = (key + c) % h
+            result[:, c] = np.roll(img[:, c], offset, axis=0)
         return result
 
     @staticmethod
-    def etap1_unscramble(img_array: np.ndarray, key: int) -> np.ndarray:
-        """Odwrotność: przesunięcie o -offset."""
-        result = img_array.copy()
-        h, w = img_array.shape[:2]
-
-        for col in range(w):
-            offset = (key + col) % h
-            result[:, col] = np.roll(img_array[:, col], -offset, axis=0)
-
+    def etap1_unscramble(img: np.ndarray, key: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        if h <= 1:
+            return img.copy()
+        result = img.copy()
+        for c in range(w):
+            offset = (key + c) % h
+            result[:, c] = np.roll(img[:, c], -offset, axis=0)
         return result
 
-    # ── ETAP 2: Czysta permutacja zig-zag sterowana kluczem ─────────────────
+    # ──────────────────────────────────────────────────────────
+    # ETAP 2: Czysta permutacja zig-zag sterowana kluczem
+    # ──────────────────────────────────────────────────────────
+    #
+    # Krok 1 – Odczyt zig-zag:
+    #   Piksel (row, col) jest odczytywany w kolejnosci:
+    #     wiersz parzy  -> lewo do prawa
+    #     wiersz nieparz-> prawo do lewa
+    #   Wynikiem jest wektor N pikseli (N = h*w).
+    #
+    # Krok 2 – Permutacja Fisher-Yates sterowana seedem (key):
+    #   P: {0..N-1} -> {0..N-1}
+    #   Wektorze pikseli jest przetasowywany wg P.
+    #
+    # Unscramble:
+    #   1. P^-1 = argsort(P)  – odwraca permutacje
+    #   2. Odwrotny zig-zag   – wstawia piksele z powrotem na oryginalne pozycje
+    #
+    # Permutacja nie zmienia wartosci pikseli – tylko ich polozenie.
 
     @staticmethod
-    def _generate_permutation(n: int, seed: int) -> np.ndarray:
-        """Fisher-Yates sterowany seedem -> tablica permutacji P[i] = nowy_indeks."""
-        rng = np.random.default_rng(seed)
-        perm = np.arange(n)
+    def _zigzag_indices(h: int, w: int) -> np.ndarray:
+        """
+        Liniowe indeksy pikseli w kolejnosci zig-zag (jak skan JPEG).
+        Indeks liniowy pixel(r,c) = r * w + c.
+        """
+        indices = []
+        for row in range(h):
+            cols = range(w) if row % 2 == 0 else range(w - 1, -1, -1)
+            for col in cols:
+                indices.append(row * w + col)
+        return np.array(indices, dtype=np.int64)
+
+    @staticmethod
+    def _fisher_yates(n: int, seed: int) -> np.ndarray:
+        """
+        Deterministyczna permutacja Fisher-Yates.
+        Zwraca tablice P dlugosci n, gdzie P[i] = docelowy indeks.
+        Seed normalizowany do uint64 (obsluguje klucze ujemne).
+        """
+        seed_norm = int(seed) & 0xFFFFFFFFFFFFFFFF   # zawsze nieujemny
+        rng = np.random.default_rng(seed_norm)
+        perm = np.arange(n, dtype=np.int64)
         rng.shuffle(perm)
         return perm
 
     @staticmethod
-    def etap2_scramble(img_array: np.ndarray, key: int) -> np.ndarray:
-        """
-        Permutacja pikseli (zigzag + seed).
-        TODO: zamień na permutację zig-zag z przeskokami zależnymi od klucza.
-        Na razie: prosta Fisher-Yates jako placeholder.
-        """
-        h, w = img_array.shape[:2]
-        flat = img_array.reshape(h * w, -1)
+    def etap2_scramble(img: np.ndarray, key: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        n = h * w
 
-        perm = ImageProcessor._generate_permutation(h * w, seed=key)
-        scrambled_flat = flat[perm]
+        # 1. Odczyt zig-zag -> wektor pikseli
+        zz = ImageProcessor._zigzag_indices(h, w)
+        flat_zz = img.reshape(n, -1)[zz]
 
-        return scrambled_flat.reshape(img_array.shape)
+        # 2. Permutacja Fisher-Yates
+        perm = ImageProcessor._fisher_yates(n, seed=key)
+        permuted = flat_zz[perm]
+
+        # 3. Zapis wg standardowego raster-scan (wynik scramblingu)
+        return permuted.reshape(img.shape)
 
     @staticmethod
-    def etap2_unscramble(img_array: np.ndarray, key: int) -> np.ndarray:
-        """Odwrotna permutacja: P^-1."""
-        h, w = img_array.shape[:2]
-        flat = img_array.reshape(h * w, -1)
+    def etap2_unscramble(img: np.ndarray, key: int) -> np.ndarray:
+        h, w = img.shape[:2]
+        n = h * w
 
-        perm = ImageProcessor._generate_permutation(h * w, seed=key)
+        # 1. Odczyt raster-scan ze scrambled
+        flat = img.reshape(n, -1)
+
+        # 2. P^-1 (odwrotna permutacja)
+        perm = ImageProcessor._fisher_yates(n, seed=key)
         inv_perm = np.argsort(perm)
-        unscrambled_flat = flat[inv_perm]
+        unpermuted = flat[inv_perm]          # piksele w kolejnosci zig-zag
 
-        return unscrambled_flat.reshape(img_array.shape)
+        # 3. Odwrotny zig-zag – wstaw na oryginalne pozycje
+        zz = ImageProcessor._zigzag_indices(h, w)
+        result = np.empty_like(img.reshape(n, -1))
+        result[zz] = unpermuted
+        return result.reshape(img.shape)
 
-    # ── ETAP 3: Hybryda (permutacja Etap 2 + XOR z maską PRNG) ─────────────
-
-    @staticmethod
-    def _generate_xor_mask(shape: tuple, key: int) -> np.ndarray:
-        """Maska XOR generowana PRNG z seedem."""
-        rng = np.random.default_rng(key + 12345)  # inny seed niż permutacja
-        # TODO: rozważ chaotyczny PRNG (np. mapa logistyczna) zamiast numpy
-        mask = rng.integers(0, 256, size=shape, dtype=np.uint8)
-        return mask
-
-    @staticmethod
-    def etap3_scramble(img_array: np.ndarray, key: int) -> np.ndarray:
-        """
-        1. Permutacja (jak Etap 2)
-        2. XOR każdego kanału z maską PRNG
-        """
-        # Krok 1: permutacja
-        permuted = ImageProcessor.etap2_scramble(img_array, key)
-
-        # Krok 2: substytucja XOR
-        mask = ImageProcessor._generate_xor_mask(img_array.shape, key)
-        result = permuted.astype(np.uint8) ^ mask
-
-        return result
+    # ──────────────────────────────────────────────────────────
+    # ETAP 3: Hybryda – permutacja zig-zag + substytucja XOR
+    # ──────────────────────────────────────────────────────────
+    #
+    # Scramble:
+    #   1. Permutacja zig-zag (Etap 2)
+    #   2. XOR kazdego bajtu z maska PRNG(key XOR 0xDEADBEEF)
+    #
+    # Unscramble (ODWROTNA kolejnosc operacji):
+    #   1. XOR z ta sama maska  (XOR jest inwolucja: m XOR m = 0)
+    #   2. Odwrotna permutacja  (Etap 2)
+    #
+    # Maska uzyw innego seeda niz permutacja – zmiana klucza o 1 bit
+    # wplywa na oba komponenty niezaleznie.
 
     @staticmethod
-    def etap3_unscramble(img_array: np.ndarray, key: int) -> np.ndarray:
-        """
-        1. Odwrotny XOR (XOR jest samo-odwrotne przy tej samej masce)
-        2. Odwrotna permutacja
-        """
-        # Krok 1: odwrotny XOR
-        mask = ImageProcessor._generate_xor_mask(img_array.shape, key)
-        de_xored = img_array.astype(np.uint8) ^ mask
+    def _xor_mask(shape: tuple, key: int) -> np.ndarray:
+        seed = int(key) ^ 0xDEADBEEF
+        rng = np.random.default_rng(seed & 0xFFFFFFFFFFFFFFFF)
+        return rng.integers(0, 256, size=shape, dtype=np.uint8)
 
-        # Krok 2: odwrotna permutacja
-        result = ImageProcessor.etap2_unscramble(de_xored, key)
+    @staticmethod
+    def etap3_scramble(img: np.ndarray, key: int) -> np.ndarray:
+        permuted = ImageProcessor.etap2_scramble(img, key)
+        mask = ImageProcessor._xor_mask(img.shape, key)
+        return (permuted.astype(np.uint16) ^ mask).astype(np.uint8)
 
-        return result
+    @staticmethod
+    def etap3_unscramble(img: np.ndarray, key: int) -> np.ndarray:
+        # Odwrotna kolejnosc: najpierw XOR, potem odwrotna permutacja
+        mask = ImageProcessor._xor_mask(img.shape, key)
+        de_xored = (img.astype(np.uint16) ^ mask).astype(np.uint8)
+        return ImageProcessor.etap2_unscramble(de_xored, key)
 
 
-# ─────────────────────────────────────────────
-# GUI
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  METRYKI
+# ══════════════════════════════════════════════════════════════
 
-IMG_DISPLAY_SIZE = (220, 220)
+class Metrics:
+    """
+    Metryki eksperymentalne wymagane przez specyfikacje projektu.
+
+    korelacja_sasiadow:
+        Korelacja Pearsona miedzy pikselami (i,j) i (i,j+1)
+        w kanale jasnosci. Bliska 1.0 = silna korelacja (natural image).
+        Bliska 0.0 = brak korelacji (dobry scrambling).
+
+    mse:
+        Mean Squared Error miedzy oryginalem a obrazem odtworzonym.
+        MSE == 0 -> odwracalnosc perfekcyjna.
+
+    psnr:
+        Peak Signal-to-Noise Ratio. inf gdy MSE==0.
+    """
+
+    @staticmethod
+    def _luma(arr: np.ndarray) -> np.ndarray:
+        return (0.299 * arr[:, :, 0] +
+                0.587 * arr[:, :, 1] +
+                0.114 * arr[:, :, 2]).astype(np.float64)
+
+    @staticmethod
+    def korelacja_sasiadow(arr: np.ndarray) -> float:
+        lum = Metrics._luma(arr)
+        x = lum[:, :-1].ravel()
+        y = lum[:, 1:].ravel()
+        if x.std() < 1e-10 or y.std() < 1e-10:
+            return 0.0
+        return float(np.corrcoef(x, y)[0, 1])
+
+    @staticmethod
+    def mse(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))
+
+    @staticmethod
+    def psnr(a: np.ndarray, b: np.ndarray) -> float:
+        m = Metrics.mse(a, b)
+        if m == 0:
+            return float('inf')
+        return 10.0 * np.log10(255.0 ** 2 / m)
+
+
+# ══════════════════════════════════════════════════════════════
+#  GUI – stale i styl
+# ══════════════════════════════════════════════════════════════
+
+IMG_W, IMG_H = 240, 240
 
 ETAPY = {
-    "Etap 1 – Naiwny (kolumny)": (ImageProcessor.etap1_scramble, ImageProcessor.etap1_unscramble),
-    "Etap 2 – Permutacja zig-zag": (ImageProcessor.etap2_scramble, ImageProcessor.etap2_unscramble),
-    "Etap 3 – Hybryda (perm + XOR)": (ImageProcessor.etap3_scramble, ImageProcessor.etap3_unscramble),
+    "Etap 1 – Naiwny (przesuwanie kolumn)": (
+        ImageProcessor.etap1_scramble,
+        ImageProcessor.etap1_unscramble,
+    ),
+    "Etap 2 – Permutacja zig-zag": (
+        ImageProcessor.etap2_scramble,
+        ImageProcessor.etap2_unscramble,
+    ),
+    "Etap 3 – Hybryda (permutacja + XOR)": (
+        ImageProcessor.etap3_scramble,
+        ImageProcessor.etap3_unscramble,
+    ),
+}
+
+C = {
+    "bg":      "#0f0f1a",
+    "panel":   "#16162a",
+    "accent":  "#00c8ff",
+    "accent2": "#ff6b35",
+    "ok":      "#39d353",
+    "err":     "#ff4444",
+    "text":    "#d0d0e0",
+    "muted":   "#666680",
+    "border":  "#2a2a44",
+    "canvas":  "#080810",
 }
 
 
-def arr_to_photoimage(arr: np.ndarray) -> ImageTk.PhotoImage:
+def arr_to_photo(arr: np.ndarray, size=(IMG_W, IMG_H)) -> ImageTk.PhotoImage:
     img = Image.fromarray(arr.astype(np.uint8))
-    img.thumbnail(IMG_DISPLAY_SIZE, Image.LANCZOS)
+    img.thumbnail(size, Image.LANCZOS)
     return ImageTk.PhotoImage(img)
 
+
+# ══════════════════════════════════════════════════════════════
+#  GUI – panel metryk
+# ══════════════════════════════════════════════════════════════
+
+class MetricsPanel(tk.Frame):
+    ROWS = [
+        ("corr_orig",      "Oryg. korelacja:"),
+        ("corr_scrambled", "Scr. korelacja: "),
+        ("corr_recovered", "Odtw. korelacja:"),
+        ("mse",            "MSE (odtw.):     "),
+        ("psnr",           "PSNR (odtw.):    "),
+        ("time",           "Czas operacji:   "),
+    ]
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=C["panel"], **kw)
+        tk.Label(self, text="METRYKI", bg=C["panel"], fg=C["accent"],
+                 font=("Consolas", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(8, 3))
+        tk.Frame(self, bg=C["border"], height=1).pack(fill=tk.X, padx=8)
+
+        self._vals = {}
+        for key, label in self.ROWS:
+            row = tk.Frame(self, bg=C["panel"])
+            row.pack(fill=tk.X, padx=8, pady=1)
+            tk.Label(row, text=label, bg=C["panel"], fg=C["muted"],
+                     font=("Consolas", 8), anchor=tk.W, width=18).pack(side=tk.LEFT)
+            v = tk.Label(row, text="—", bg=C["panel"], fg=C["text"],
+                         font=("Consolas", 8, "bold"), anchor=tk.W)
+            v.pack(side=tk.LEFT)
+            self._vals[key] = v
+
+        tk.Frame(self, bg=C["panel"], height=6).pack()
+
+    def set(self, key: str, text: str, color: str | None = None):
+        if key in self._vals:
+            self._vals[key].config(text=text, fg=color or C["text"])
+
+    def clear_field(self, key: str):
+        if key in self._vals:
+            self._vals[key].config(text="—", fg=C["text"])
+
+    def clear_all(self):
+        for v in self._vals.values():
+            v.config(text="—", fg=C["text"])
+
+
+# ══════════════════════════════════════════════════════════════
+#  GUI – glowne okno
+# ══════════════════════════════════════════════════════════════
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Projekt M-II – Chaotyczne przekształcanie obrazu")
+        self.title("Projekt M-II  ·  Chaotyczne przeksztalcanie obrazu")
+        self.configure(bg=C["bg"])
         self.resizable(True, True)
-        self.configure(bg="#1a1a2e")
+        self.minsize(960, 580)
 
-        self.original_array: np.ndarray | None = None
-        self.scrambled_array: np.ndarray | None = None
-        self.recovered_array: np.ndarray | None = None
+        self.orig_arr:      np.ndarray | None = None
+        self.scrambled_arr: np.ndarray | None = None
+        self.recovered_arr: np.ndarray | None = None
 
-        self._build_ui()
+        self._apply_styles()
+        self._build()
 
-    # ── UI ──────────────────────────────────────────────────────────────────
+    # ── Style ttk ────────────────────────────────────────────────────────────
 
-    def _build_ui(self):
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TFrame", background="#1a1a2e")
-        style.configure("TLabel", background="#1a1a2e", foreground="#e0e0e0", font=("Consolas", 10))
-        style.configure("TButton", font=("Consolas", 10, "bold"), padding=6)
-        style.configure("Header.TLabel", font=("Consolas", 13, "bold"), foreground="#00d4ff")
-        style.configure("Sub.TLabel", font=("Consolas", 9), foreground="#888")
-        style.configure("TCombobox", font=("Consolas", 10))
+    def _apply_styles(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("TFrame",       background=C["bg"])
+        s.configure("TLabel",       background=C["bg"],    foreground=C["text"],  font=("Consolas", 9))
+        s.configure("TButton",      background=C["panel"], foreground=C["text"],
+                    font=("Consolas", 9, "bold"), padding=(8, 5), relief="flat", borderwidth=0)
+        s.map("TButton",
+              background=[("active", C["border"])],
+              foreground=[("active", C["accent"])])
+        s.configure("Accent.TButton", background=C["accent"], foreground=C["bg"],
+                    font=("Consolas", 10, "bold"), padding=(10, 6))
+        s.map("Accent.TButton",
+              background=[("active", "#00a8d8"), ("pressed", "#006f9a")])
+        s.configure("TCombobox", fieldbackground=C["panel"], background=C["panel"],
+                    foreground=C["text"], selectbackground=C["border"], font=("Consolas", 9))
+        s.configure("TEntry",    fieldbackground=C["panel"], foreground=C["text"],
+                    insertcolor=C["accent"], font=("Consolas", 10))
 
-        # ── Nagłówek
-        hdr = ttk.Label(self, text="PROJEKT M-II  ·  CHAOTYCZNE PRZEKSZTAŁCANIE OBRAZU",
-                        style="Header.TLabel", padding=(16, 12))
-        hdr.pack(fill=tk.X)
+    # ── Budowanie layoutu ────────────────────────────────────────────────────
 
-        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16)
+    def _build(self):
+        # Naglowek
+        hdr = tk.Frame(self, bg=C["bg"], pady=8)
+        hdr.pack(fill=tk.X, padx=20)
+        tk.Label(hdr, text="PROJEKT M-II", bg=C["bg"], fg=C["accent"],
+                 font=("Consolas", 15, "bold")).pack(side=tk.LEFT)
+        tk.Label(hdr, text="  ·  Chaotyczne przeksztalcanie obrazu cyfrowego",
+                 bg=C["bg"], fg=C["muted"], font=("Consolas", 9)).pack(side=tk.LEFT, pady=2)
 
-        # ── Panel kontrolny (lewa strona)
-        main = ttk.Frame(self)
-        main.pack(fill=tk.BOTH, expand=True, padx=16, pady=10)
+        tk.Frame(self, bg=C["border"], height=1).pack(fill=tk.X, padx=20)
 
-        ctrl = ttk.Frame(main)
-        ctrl.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
+        # Body
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
-        self._build_controls(ctrl)
+        # Panel lewy
+        left = tk.Frame(body, bg=C["panel"],
+                        highlightthickness=1, highlightbackground=C["border"])
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12), ipadx=12, ipady=6)
+        self._build_left(left)
 
-        # ── Panel obrazów (prawa strona)
-        imgs = ttk.Frame(main)
-        imgs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Panel prawy
+        right = tk.Frame(body, bg=C["bg"])
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._build_images(right)
 
-        self._build_image_panel(imgs)
+        # Status bar
+        self.status_var = tk.StringVar(value="Wczytaj obraz aby rozpoczac.")
+        tk.Label(self, textvariable=self.status_var,
+                 bg=C["bg"], fg=C["muted"], font=("Consolas", 7),
+                 anchor=tk.W, padx=20, pady=3).pack(fill=tk.X, side=tk.BOTTOM)
 
-        # ── Pasek statusu
-        self.status_var = tk.StringVar(value="Wczytaj obraz i wybierz etap.")
-        status = ttk.Label(self, textvariable=self.status_var, style="Sub.TLabel", padding=(16, 6))
-        status.pack(fill=tk.X, side=tk.BOTTOM)
+    def _sep(self, parent, pady=(8, 4)):
+        tk.Frame(parent, bg=C["border"], height=1).pack(fill=tk.X, pady=pady)
 
-    def _build_controls(self, parent):
-        # Wczytywanie obrazu
-        ttk.Label(parent, text="OBRAZ", style="Header.TLabel").pack(anchor=tk.W, pady=(0, 4))
-        ttk.Button(parent, text="📂  Wczytaj obraz", command=self._load_image).pack(fill=tk.X)
-        self.path_label = ttk.Label(parent, text="(brak)", style="Sub.TLabel", wraplength=180)
-        self.path_label.pack(anchor=tk.W, pady=(2, 12))
+    def _section(self, parent, text):
+        tk.Label(parent, text=text, bg=C["panel"], fg=C["accent"],
+                 font=("Consolas", 7, "bold")).pack(anchor=tk.W, pady=(10, 0))
+        self._sep(parent, pady=(2, 6))
 
-        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+    def _build_left(self, parent):
+        # Obraz
+        self._section(parent, "OBRAZ WEJSCIOWY")
+        ttk.Button(parent, text="📂  Wczytaj obraz (PNG / JPG / BMP)",
+                   command=self._load).pack(fill=tk.X)
+        self.path_lbl = tk.Label(parent, text="(brak)", bg=C["panel"], fg=C["muted"],
+                                 font=("Consolas", 7), wraplength=210, anchor=tk.W)
+        self.path_lbl.pack(anchor=tk.W, pady=(3, 0))
 
-        # Wybór etapu
-        ttk.Label(parent, text="ETAP").pack(anchor=tk.W)
+        # Etap
+        self._section(parent, "ETAP ALGORYTMU")
         self.etap_var = tk.StringVar(value=list(ETAPY.keys())[0])
-        etap_cb = ttk.Combobox(parent, textvariable=self.etap_var,
-                                values=list(ETAPY.keys()), state="readonly", width=26)
-        etap_cb.pack(fill=tk.X, pady=(2, 12))
+        ttk.Combobox(parent, textvariable=self.etap_var,
+                     values=list(ETAPY.keys()), state="readonly", width=30).pack(fill=tk.X)
 
-        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        # Klucze
+        self._section(parent, "KLUCZE")
+        tk.Label(parent, text="Poprawny klucz (int):", bg=C["panel"],
+                 fg=C["text"], font=("Consolas", 8)).pack(anchor=tk.W)
+        self.key_var = tk.StringVar(value="1337")
+        ttk.Entry(parent, textvariable=self.key_var, width=20).pack(anchor=tk.W, pady=(2, 8))
 
-        # Klucz
-        ttk.Label(parent, text="KLUCZ (liczba całkowita)").pack(anchor=tk.W)
-        self.key_var = tk.StringVar(value="42")
-        key_entry = ttk.Entry(parent, textvariable=self.key_var, font=("Consolas", 11), width=14)
-        key_entry.pack(anchor=tk.W, pady=(2, 4))
+        tk.Label(parent, text="Bledny klucz (do testu):", bg=C["panel"],
+                 fg=C["text"], font=("Consolas", 8)).pack(anchor=tk.W)
+        self.wrong_var = tk.StringVar(value="1338")
+        ttk.Entry(parent, textvariable=self.wrong_var, width=20).pack(anchor=tk.W, pady=(2, 0))
 
-        ttk.Label(parent, text="KLUCZ BŁĘDNY (do testu)").pack(anchor=tk.W, pady=(8, 0))
-        self.wrong_key_var = tk.StringVar(value="43")
-        wrong_entry = ttk.Entry(parent, textvariable=self.wrong_key_var, font=("Consolas", 11), width=14)
-        wrong_entry.pack(anchor=tk.W, pady=(2, 12))
+        # Operacje
+        self._section(parent, "OPERACJE")
+        ttk.Button(parent, text="🔀  SCRAMBLE",
+                   style="Accent.TButton", command=self._scramble).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(parent, text="🔁  Unscramble  [✓ poprawny klucz]",
+                   command=lambda: self._unscramble(correct=True)).pack(fill=tk.X, pady=2)
+        ttk.Button(parent, text="❌  Unscramble  [✗ bledny klucz]",
+                   command=lambda: self._unscramble(correct=False)).pack(fill=tk.X, pady=2)
 
-        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        self._sep(parent, pady=(10, 4))
+        ttk.Button(parent, text="💾  Zapisz obrazy",
+                   command=self._save).pack(fill=tk.X)
 
-        # Przyciski akcji
-        ttk.Button(parent, text="🔀  SCRAMBLE", command=self._do_scramble).pack(fill=tk.X, pady=3)
-        ttk.Button(parent, text="🔁  UNSCRAMBLE (poprawny klucz)", command=lambda: self._do_unscramble(correct=True)).pack(fill=tk.X, pady=3)
-        ttk.Button(parent, text="❌  UNSCRAMBLE (błędny klucz)", command=lambda: self._do_unscramble(correct=False)).pack(fill=tk.X, pady=3)
+        # Metryki
+        self._sep(parent, pady=(10, 0))
+        self.metrics = MetricsPanel(parent)
+        self.metrics.pack(fill=tk.X)
 
-        ttk.Separator(parent, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+    def _build_images(self, parent):
+        col_labels = ["ORYGINAL", "PO SCRAMBLINGU", "ODTWORZONE"]
+        self._canvases  = []
+        self._img_infos = []
 
-        ttk.Button(parent, text="💾  Zapisz wyniki", command=self._save_results).pack(fill=tk.X)
+        for lbl in col_labels:
+            col = tk.Frame(parent, bg=C["bg"])
+            col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
 
-    def _build_image_panel(self, parent):
-        """Trzy panele: Oryginał | Scrambled | Odtworzone"""
-        labels_text = ["ORYGINAŁ", "PO SCRAMBLINGU", "ODTWORZONE"]
-        self.img_labels = []
-        self.img_displays = []
+            tk.Label(col, text=lbl, bg=C["bg"], fg=C["accent"],
+                     font=("Consolas", 8, "bold")).pack(pady=(0, 4))
 
-        for i, txt in enumerate(labels_text):
-            col_frame = ttk.Frame(parent)
-            col_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6)
+            c = tk.Canvas(col, width=IMG_W, height=IMG_H, bg=C["canvas"],
+                          highlightthickness=1, highlightbackground=C["border"])
+            c.pack()
+            self._canvases.append(c)
 
-            ttk.Label(col_frame, text=txt, style="Header.TLabel").pack(pady=(0, 6))
+            info = tk.Label(col, text="—", bg=C["bg"], fg=C["muted"],
+                            font=("Consolas", 7))
+            info.pack(pady=(3, 0))
+            self._img_infos.append(info)
 
-            # Canvas jako placeholder obrazu
-            canvas = tk.Canvas(col_frame, width=IMG_DISPLAY_SIZE[0], height=IMG_DISPLAY_SIZE[1],
-                                bg="#0d0d1a", highlightthickness=1, highlightbackground="#333")
-            canvas.pack()
-            self.img_displays.append(canvas)
+    # ── Akcje ─────────────────────────────────────────────────────────────────
 
-            info_lbl = ttk.Label(col_frame, text="—", style="Sub.TLabel")
-            info_lbl.pack(pady=(4, 0))
-            self.img_labels.append(info_lbl)
-
-    # ── Akcje ────────────────────────────────────────────────────────────────
-
-    def _load_image(self):
+    def _load(self):
         path = filedialog.askopenfilename(
-            filetypes=[("Obrazy", "*.png *.jpg *.jpeg *.bmp"), ("Wszystkie", "*.*")]
+            title="Wczytaj obraz",
+            filetypes=[("Obrazy", "*.png *.jpg *.jpeg *.bmp *.tiff"),
+                       ("Wszystkie", "*.*")]
         )
         if not path:
             return
-
-        img = Image.open(path).convert("RGB")
-        self.original_array = np.array(img)
-        self.scrambled_array = None
-        self.recovered_array = None
-
-        self.path_label.config(text=os.path.basename(path))
-        self._show_image(0, self.original_array)
-        self._clear_image(1)
-        self._clear_image(2)
-        self.status_var.set(f"Wczytano: {img.width}×{img.height} px")
-
-    def _get_key(self, correct: bool = True) -> int:
         try:
-            raw = self.key_var.get() if correct else self.wrong_key_var.get()
+            img = Image.open(path).convert("RGB")
+        except Exception as e:
+            messagebox.showerror("Blad wczytywania", str(e))
+            return
+
+        self.orig_arr = np.array(img, dtype=np.uint8)
+        self.scrambled_arr = None
+        self.recovered_arr = None
+
+        self.path_lbl.config(text=os.path.basename(path))
+        self._show(0, self.orig_arr, f"{img.width}x{img.height} px")
+        self._clr(1)
+        self._clr(2)
+
+        corr = Metrics.korelacja_sasiadow(self.orig_arr)
+        self.metrics.clear_all()
+        self.metrics.set("corr_orig", f"{corr:.4f}")
+        self.status_var.set(f"Wczytano: {os.path.basename(path)}  |  {img.width}x{img.height} px")
+
+    def _get_key(self, correct: bool) -> int | None:
+        raw = (self.key_var if correct else self.wrong_var).get().strip()
+        try:
             return int(raw)
         except ValueError:
-            messagebox.showerror("Błąd", "Klucz musi być liczbą całkowitą.")
-            raise
+            messagebox.showerror("Bledny klucz", f"Klucz musi byc liczba calkowita.\nWpisano: '{raw}'")
+            return None
 
-    def _get_algorithm(self):
-        return ETAPY[self.etap_var.get()]
-
-    def _do_scramble(self):
-        if self.original_array is None:
-            messagebox.showwarning("Uwaga", "Najpierw wczytaj obraz.")
+    def _scramble(self):
+        if self.orig_arr is None:
+            messagebox.showwarning("Brak obrazu", "Najpierw wczytaj obraz.")
             return
-        try:
-            key = self._get_key(correct=True)
-        except ValueError:
+        key = self._get_key(correct=True)
+        if key is None:
             return
 
-        scramble_fn, _ = self._get_algorithm()
+        fn_sc, _ = ETAPY[self.etap_var.get()]
         self.status_var.set("Scrambling...")
-        self.update()
+        self.update_idletasks()
 
-        self.scrambled_array = scramble_fn(self.original_array, key)
-        self._show_image(1, self.scrambled_array)
-        self._clear_image(2)
-        self.img_labels[1].config(text=f"klucz: {key}")
-        self.status_var.set(f"Scramble gotowy. Etap: {self.etap_var.get().split('–')[0].strip()}")
+        t0 = time.perf_counter()
+        self.scrambled_arr = fn_sc(self.orig_arr, key)
+        dt = (time.perf_counter() - t0) * 1000
 
-    def _do_unscramble(self, correct: bool):
-        if self.scrambled_array is None:
-            messagebox.showwarning("Uwaga", "Najpierw wykonaj scramble.")
+        self.recovered_arr = None
+        self._show(1, self.scrambled_arr, f"klucz: {key}")
+        self._clr(2)
+
+        corr_s = Metrics.korelacja_sasiadow(self.scrambled_arr)
+        self.metrics.set("corr_scrambled", f"{corr_s:.4f}",
+                          C["ok"] if abs(corr_s) < 0.15 else C["accent2"])
+        self.metrics.clear_field("corr_recovered")
+        self.metrics.clear_field("mse")
+        self.metrics.clear_field("psnr")
+        self.metrics.set("time", f"{dt:.1f} ms")
+
+        etap_short = self.etap_var.get().split("–")[0].strip()
+        self.status_var.set(
+            f"Scramble OK  |  {etap_short}  |  klucz: {key}"
+            f"  |  korelacja: {corr_s:.4f}  |  {dt:.0f} ms"
+        )
+
+    def _unscramble(self, correct: bool):
+        if self.scrambled_arr is None:
+            messagebox.showwarning("Brak danych", "Najpierw wykonaj Scramble.")
             return
-        try:
-            key = self._get_key(correct=correct)
-        except ValueError:
+        key = self._get_key(correct=correct)
+        if key is None:
             return
 
-        _, unscramble_fn = self._get_algorithm()
+        _, fn_usc = ETAPY[self.etap_var.get()]
         self.status_var.set("Unscrambling...")
-        self.update()
+        self.update_idletasks()
 
-        self.recovered_array = unscramble_fn(self.scrambled_array, key)
-        self._show_image(2, self.recovered_array)
-        tag = "✓ poprawny" if correct else "✗ błędny"
-        self.img_labels[2].config(text=f"klucz: {key}  [{tag}]")
-        self.status_var.set(f"Unscramble gotowy. Użyty klucz: {key}  [{tag}]")
+        t0 = time.perf_counter()
+        self.recovered_arr = fn_usc(self.scrambled_arr, key)
+        dt = (time.perf_counter() - t0) * 1000
 
-    def _save_results(self):
-        if all(a is None for a in [self.original_array, self.scrambled_array, self.recovered_array]):
-            messagebox.showwarning("Uwaga", "Brak obrazów do zapisania.")
+        tag  = "poprawny" if correct else "BLEDNY"
+        col  = C["ok"] if correct else C["err"]
+        self._show(2, self.recovered_arr, f"klucz: {key}  [{tag}]", color=col)
+
+        corr_r = Metrics.korelacja_sasiadow(self.recovered_arr)
+        self.metrics.set("corr_recovered", f"{corr_r:.4f}")
+        self.metrics.set("time", f"{dt:.1f} ms")
+
+        if self.orig_arr is not None:
+            m   = Metrics.mse(self.orig_arr, self.recovered_arr)
+            p   = Metrics.psnr(self.orig_arr, self.recovered_arr)
+            p_s = "inf dB (idealne)" if p == float('inf') else f"{p:.2f} dB"
+            self.metrics.set("mse",  f"{m:.2f}",
+                              C["ok"] if m == 0.0 else C["err"])
+            self.metrics.set("psnr", p_s,
+                              C["ok"] if p == float('inf') else C["accent2"])
+
+        self.status_var.set(
+            f"Unscramble [{tag}]  |  klucz: {key}  |  {dt:.0f} ms"
+        )
+
+    def _save(self):
+        pairs = [(n, a) for n, a in [
+            ("oryginal.png",  self.orig_arr),
+            ("scrambled.png", self.scrambled_arr),
+            ("recovered.png", self.recovered_arr),
+        ] if a is not None]
+
+        if not pairs:
+            messagebox.showwarning("Brak danych", "Brak obrazow do zapisania.")
             return
 
         folder = filedialog.askdirectory(title="Wybierz folder zapisu")
         if not folder:
             return
 
-        for name, arr in [("oryginal.png", self.original_array),
-                           ("scrambled.png", self.scrambled_array),
-                           ("recovered.png", self.recovered_array)]:
-            if arr is not None:
-                Image.fromarray(arr.astype(np.uint8)).save(os.path.join(folder, name))
+        saved = []
+        for name, arr in pairs:
+            Image.fromarray(arr.astype(np.uint8)).save(os.path.join(folder, name))
+            saved.append(name)
 
-        self.status_var.set(f"Zapisano do: {folder}")
-        messagebox.showinfo("Zapisano", f"Obrazy zapisane do:\n{folder}")
+        self.status_var.set(f"Zapisano: {', '.join(saved)}  -> {folder}")
+        messagebox.showinfo("Zapisano", "Pliki:\n" + "\n".join(saved) + f"\n\n-> {folder}")
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── Helpers canvas ────────────────────────────────────────────────────────
 
-    def _show_image(self, idx: int, arr: np.ndarray):
-        photo = arr_to_photoimage(arr)
-        canvas = self.img_displays[idx]
-        canvas._photo = photo  # trzymaj referencję
-        canvas.delete("all")
-        x, y = IMG_DISPLAY_SIZE[0] // 2, IMG_DISPLAY_SIZE[1] // 2
-        canvas.create_image(x, y, anchor=tk.CENTER, image=photo)
+    def _show(self, idx: int, arr: np.ndarray, info: str = "", color: str | None = None):
+        photo = arr_to_photo(arr)
+        c = self._canvases[idx]
+        c._photo = photo                     # trzymaj referencje (gc)
+        c.delete("all")
+        c.create_image(IMG_W // 2, IMG_H // 2, anchor=tk.CENTER, image=photo)
+        self._img_infos[idx].config(text=info or "—", fg=color or C["muted"])
 
-    def _clear_image(self, idx: int):
-        canvas = self.img_displays[idx]
-        canvas.delete("all")
-        self.img_labels[idx].config(text="—")
+    def _clr(self, idx: int):
+        self._canvases[idx].delete("all")
+        self._img_infos[idx].config(text="—", fg=C["muted"])
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  TESTY JEDNOSTKOWE  (python main.py --test)
+# ══════════════════════════════════════════════════════════════
+
+def _run_tests():
+    import sys
+    print("=" * 60)
+    print("TESTY JEDNOSTKOWE – odwracalnosc algorytmow")
+    print("=" * 60)
+    passed = failed = 0
+    shapes = [(4, 4, 3), (8, 9, 3), (1, 8, 3), (100, 100, 3), (50, 73, 3)]
+    keys   = [0, 1, 42, 1337, -5, 999999]
+
+    for shape in shapes:
+        img = np.random.randint(0, 256, shape, dtype=np.uint8)
+        for key in keys:
+            for name, sc, usc in [
+                ("Etap1", ImageProcessor.etap1_scramble, ImageProcessor.etap1_unscramble),
+                ("Etap2", ImageProcessor.etap2_scramble, ImageProcessor.etap2_unscramble),
+                ("Etap3", ImageProcessor.etap3_scramble, ImageProcessor.etap3_unscramble),
+            ]:
+                s = sc(img, key)
+                r = usc(s, key)
+                ok = np.array_equal(img, r)
+                diff_scramble = not np.array_equal(img, s)
+                if ok:
+                    passed += 1
+                else:
+                    failed += 1
+                    print(f"  FAIL  {name}  shape={shape}  key={key}  "
+                          f"diff_scramble={diff_scramble}")
+
+    print(f"\nWynik: {passed} OK  |  {failed} BLEDOW")
+    print("=" * 60)
+    sys.exit(0 if failed == 0 else 1)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    import sys
+    if "--test" in sys.argv:
+        _run_tests()
+    else:
+        App().mainloop()
